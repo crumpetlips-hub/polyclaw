@@ -46,7 +46,7 @@ from lib.models import (
 from scripts.trade import TradeExecutor
 from lib.calibrator import (
     CalibrationEngine, PerformanceStore, CalibrationParams,
-    record_resolved_position, category_of,
+    record_resolved_position, category_of, REPORT_FILE,
 )
 
 
@@ -133,17 +133,21 @@ class TediumBot:
     def _init_models(self) -> None:
         """Build/rebuild models using current calibration params."""
         c = self.calib
-        self.edge_model   = EdgeModel(min_edge=c.edge_min_edge)
-        self.kelly        = KellyModel(kelly_fraction=0.25)  # base; per-strategy pct applied at call site
+        boost = c.maturity_edge_boost  # raises the bar as bot matures
+        self.edge_model   = EdgeModel(min_edge=c.edge_min_edge + boost)
+        self.kelly        = KellyModel(kelly_fraction=0.25)
         self.bond_scanner = BondScanner(
             min_price=0.90, max_price=0.97, min_days=2.0, max_days=14,
             min_annualised=c.bond_min_annualised,
         )
         self.ls_fader = LongshotFader(
-            max_yes_price=0.10, min_edge=c.longshot_min_edge,
+            max_yes_price=0.10, min_edge=c.longshot_min_edge + boost,
         )
         self.ls_fader.LONGSHOT_FACTOR = c.longshot_factor
-        self.multi_scanner = MultiOutcomeScanner(min_edge=c.multi_min_edge)
+        self.multi_scanner = MultiOutcomeScanner(min_edge=c.multi_min_edge + boost)
+
+        if REPORT_FILE.exists():
+            log.info(f"[CALIB] Self-report:\n{REPORT_FILE.read_text()}")
 
     def _apply_calibration(self, new_params: CalibrationParams) -> None:
         """Apply updated calibration params and rebuild models."""
@@ -210,6 +214,11 @@ class TediumBot:
             self._cooldown_file.write_text(json.dumps(raw))
         except Exception as e:
             log.warning(f"Failed to save cooldowns: {e}")
+
+    def _category_kelly_factor(self, question: str) -> float:
+        """Return per-category Kelly multiplier from calibration (default 1.0)."""
+        cat = category_of(question)
+        return getattr(self.calib, f"category_kelly_{cat}", 1.0)
 
     def _already_alerted(self, key: str) -> bool:
         last = self.last_alerted.get(key)
@@ -314,12 +323,13 @@ class TediumBot:
         days = self.stoikov.days_to_resolution(market.end_date)
         aggressive = self.stoikov.should_hit_aggressively(edge=edge.edge, days_to_resolution=days)
 
-        # Model 5: Kelly
+        # Model 5: Kelly — scale by category factor (reduces sizing in losing categories)
+        cat_factor = self._category_kelly_factor(market.question)
         kelly = self.kelly.size(
             bankroll=balance,
             win_prob=edge.model_prob,
             market_price=edge.market_price,
-            max_position_pct=MAX_POSITION_PCT,
+            max_position_pct=MAX_POSITION_PCT * cat_factor,
         )
         if kelly.size_usd < 1.0:
             return None
@@ -332,6 +342,22 @@ class TediumBot:
         )
         if not mc.passed:
             log.debug(f"MC fail: {market.question[:40]} ({mc.profitable_pct:.0%})")
+            return None
+
+        # Agreement filter: require at least 2 independent signals to align
+        agreement = 0
+        if model_prob > edge.market_price + 0.03:        # Bayesian is confident
+            agreement += 1
+        if edge.edge > MIN_EDGE * 1.5:                   # Edge is strong, not marginal
+            agreement += 1
+        if correlated_signal is not None:                 # Spread model confirms
+            agreement += 1
+        if aggressive:                                    # Stoikov says act urgently
+            agreement += 1
+        if mc.profitable_pct > 0.75:                     # Monte Carlo strongly passes
+            agreement += 1
+        if agreement < 2:
+            log.debug(f"Low agreement ({agreement}/5): {market.question[:40]}")
             return None
 
         return {
