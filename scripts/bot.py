@@ -456,6 +456,7 @@ class TediumBot:
         """Run longshot fader on a market. Returns unified opp dict or None."""
         if market.closed or market.resolved or not market.active:
             return None
+        days = self.stoikov.days_to_resolution(market.end_date)
         result = self.ls_fader.scan(
             market_id=market.id,
             question=market.question,
@@ -463,10 +464,10 @@ class TediumBot:
             no_price=market.no_price,
             balance=balance,
             max_position_pct=MAX_POSITION_PCT,
+            days=days,
         )
         if result is None:
             return None
-        days = self.stoikov.days_to_resolution(market.end_date)
         from lib.models import EdgeResult
         edge = EdgeResult(
             market_id=market.id,

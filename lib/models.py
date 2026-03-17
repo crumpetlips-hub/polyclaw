@@ -513,9 +513,10 @@ class LongshotFader:
 
     LONGSHOT_FACTOR = 0.40  # true win rate as fraction of market-implied rate
 
-    def __init__(self, max_yes_price: float = 0.10, min_edge: float = 0.02):
+    def __init__(self, max_yes_price: float = 0.10, min_edge: float = 0.02, max_days: float = 90.0):
         self.max_yes_price = max_yes_price
         self.min_edge = min_edge
+        self.max_days = max_days
 
     def scan(
         self,
@@ -525,11 +526,14 @@ class LongshotFader:
         no_price: float,
         balance: float,
         max_position_pct: float = 0.10,
+        days: float = 0.0,
     ) -> Optional[LongshotResult]:
         """Return LongshotResult if NO has edge from longshot bias, else None."""
         if yes_price > self.max_yes_price or yes_price <= 0:
             return None
         if no_price <= 0:
+            return None
+        if days > self.max_days:
             return None
 
         true_prob_yes = yes_price * self.LONGSHOT_FACTOR
