@@ -39,6 +39,8 @@ from lib.position_storage import PositionStorage, PositionEntry
 from lib.models import (
     BayesianModel, EdgeModel, SpreadModel,
     StoikovModel, KellyModel, MonteCarloModel,
+    BondScanner, LongshotFader,
+    TAKER_FEE, SLIPPAGE,
 )
 from scripts.trade import TradeExecutor
 
@@ -82,12 +84,14 @@ class TediumBot:
         self.gamma  = GammaClient()
         self.wallet = WalletManager()
 
-        self.bayesian    = BayesianModel()
-        self.edge_model  = EdgeModel(min_edge=MIN_EDGE)
-        self.spread      = SpreadModel(z_threshold=2.0)
-        self.stoikov     = StoikovModel()
-        self.kelly       = KellyModel(kelly_fraction=0.25)
-        self.monte_carlo = MonteCarloModel(scenarios=1000)
+        self.bayesian     = BayesianModel()
+        self.edge_model   = EdgeModel(min_edge=MIN_EDGE)
+        self.spread       = SpreadModel(z_threshold=2.0)
+        self.stoikov      = StoikovModel()
+        self.kelly        = KellyModel(kelly_fraction=0.25)
+        self.monte_carlo  = MonteCarloModel(scenarios=1000)
+        self.bond_scanner = BondScanner(min_price=0.90, max_price=0.97, max_days=14, min_annualised=0.50)
+        self.ls_fader     = LongshotFader(max_yes_price=0.10, min_edge=MIN_EDGE)
 
         # CLOB client cached — auth happens once, not per market
         self._clob: Optional[ClobClientWrapper] = None
@@ -227,6 +231,83 @@ class TediumBot:
             "days": days,
         }
 
+    def _bond_opp(self, market: Market, balance: float) -> Optional[dict]:
+        """Run bond scanner on a market. Returns unified opp dict or None."""
+        if market.closed or market.resolved or not market.active:
+            return None
+        days = self.stoikov.days_to_resolution(market.end_date)
+        result = self.bond_scanner.scan(
+            market_id=market.id,
+            question=market.question,
+            yes_price=market.yes_price,
+            no_price=market.no_price,
+            days=days,
+            balance=balance,
+            max_position_pct=MAX_POSITION_PCT,
+        )
+        if result is None:
+            return None
+        from lib.models import EdgeResult, KellyResult
+        edge = EdgeResult(
+            market_id=market.id,
+            question=market.question,
+            position=result.position,
+            market_price=result.price,
+            model_prob=0.99,
+            edge=result.gross_return,
+            pure_arb=0.0,
+            fees=TAKER_FEE + SLIPPAGE,
+        )
+        kelly = KellyResult(full_kelly=1.0, quarter_kelly=MAX_POSITION_PCT,
+                            size_usd=result.size_usd, max_loss_usd=result.size_usd)
+        return {
+            "market": market, "edge": edge, "kelly": kelly,
+            "mc": None, "aggressive": True, "days": days,
+            "strategy": "bond",
+            "annualised": result.annualised_return,
+        }
+
+    def _longshot_opp(self, market: Market, balance: float) -> Optional[dict]:
+        """Run longshot fader on a market. Returns unified opp dict or None."""
+        if market.closed or market.resolved or not market.active:
+            return None
+        result = self.ls_fader.scan(
+            market_id=market.id,
+            question=market.question,
+            yes_price=market.yes_price,
+            no_price=market.no_price,
+            balance=balance,
+            max_position_pct=MAX_POSITION_PCT,
+        )
+        if result is None:
+            return None
+        days = self.stoikov.days_to_resolution(market.end_date)
+        from lib.models import EdgeResult
+        edge = EdgeResult(
+            market_id=market.id,
+            question=market.question,
+            position="NO",
+            market_price=result.no_price,
+            model_prob=1.0 - result.true_prob_yes,
+            edge=result.edge,
+            pure_arb=0.0,
+            fees=TAKER_FEE + SLIPPAGE,
+        )
+        kelly = self.kelly.size(
+            bankroll=balance,
+            win_prob=edge.model_prob,
+            market_price=edge.market_price,
+            max_position_pct=MAX_POSITION_PCT,
+        )
+        if kelly.size_usd < 1.0:
+            return None
+        return {
+            "market": market, "edge": edge, "kelly": kelly,
+            "mc": None, "aggressive": False, "days": days,
+            "strategy": "longshot",
+            "yes_price": result.yes_price,
+        }
+
     async def _scan(self, balance: float) -> list[dict]:
         """Fetch markets, run spread detection + individual analysis."""
         opportunities: list[dict] = {}  # market_id -> best opp
@@ -244,18 +325,30 @@ class TediumBot:
         except Exception as e:
             log.warning(f"Spread scan error: {e}")
 
-        # Individual market analysis
+        # Individual market analysis + specialist scanners
         try:
             markets = await self.gamma.get_trending_markets(limit=SCAN_LIMIT)
             log.info(f"Scanning {len(markets)} markets (balance: ${balance:.2f})")
 
             for market in markets:
+                # Core 6-model pipeline
                 signal = correlated.get(market.id)
                 opp = self._analyze(market, balance, correlated_signal=signal)
-                if opp:
+
+                # Bond scanner (near-certain, resolves soon)
+                bond = self._bond_opp(market, balance)
+
+                # Longshot fader (YES < 10¢, buy NO)
+                ls = self._longshot_opp(market, balance)
+
+                # Keep best opportunity per market (highest edge wins)
+                for candidate in (opp, bond, ls):
+                    if candidate is None:
+                        continue
                     mid = market.id
-                    if mid not in opportunities or opp["edge"].edge > opportunities[mid]["edge"].edge:
-                        opportunities[mid] = opp
+                    if mid not in opportunities or candidate["edge"].edge > opportunities[mid]["edge"].edge:
+                        opportunities[mid] = candidate
+
         except Exception as e:
             log.error(f"Market scan error: {e}")
 
@@ -285,11 +378,25 @@ class TediumBot:
 
     def _alert(self, opp: dict) -> None:
         e, k = opp["edge"], opp["kelly"]
+        strategy = opp.get("strategy", "edge")
         exec_type = "FOK" if opp["aggressive"] else "GTC"
-        log.info(
-            f"Opportunity: {e.position} '{opp['market'].question[:50]}' "
-            f"edge={e.edge:.2%} size=${k.size_usd:.2f} {exec_type}"
-        )
+
+        if strategy == "bond":
+            log.info(
+                f"[BOND] {e.position} '{opp['market'].question[:50]}' "
+                f"price={e.market_price:.2f} return={opp['annualised']:.0%}pa "
+                f"days={opp['days']:.0f} size=${k.size_usd:.2f}"
+            )
+        elif strategy == "longshot":
+            log.info(
+                f"[LONGSHOT] NO '{opp['market'].question[:50]}' "
+                f"YES={opp['yes_price']:.2f} edge={e.edge:.2%} size=${k.size_usd:.2f}"
+            )
+        else:
+            log.info(
+                f"[EDGE] {e.position} '{opp['market'].question[:50]}' "
+                f"edge={e.edge:.2%} size=${k.size_usd:.2f} {exec_type}"
+            )
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 

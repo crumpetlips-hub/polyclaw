@@ -1,11 +1,17 @@
-"""Six quantitative models for Polymarket edge detection.
+"""Quantitative models for Polymarket edge detection.
 
+Core pipeline (6 models):
 1. BayesianModel  - probability estimation from order book + correlated markets
 2. EdgeModel      - EV filter (q - p - c) and pure arb check
 3. SpreadModel    - z-score dislocation between related markets in an event
 4. StoikovModel   - passive (GTC) vs aggressive (FOK) execution decision
 5. KellyModel     - quarter-Kelly position sizing
 6. MonteCarloModel - stress test: pass if P(profitable) >= threshold
+
+Specialist scanners:
+7. BondScanner    - near-certain contracts (90-97¢) resolving soon = high annualised return
+8. LongshotFader  - YES < 10¢ markets are systematically overpriced (longshot bias);
+                    buy NO for edge
 """
 
 import math
@@ -336,4 +342,156 @@ class MonteCarloModel:
             worst_case=outcomes[0],
             p5_outcome=outcomes[int(n * 0.05)],
             passed=profitable_pct >= self.pass_threshold,
+        )
+
+
+# ── Scanner 7: Bond ───────────────────────────────────────────────────────────
+
+@dataclass
+class BondResult:
+    market_id: str
+    question: str
+    position: str        # "YES" or "NO" — whichever is near-certain
+    price: float         # e.g. 0.95
+    days: float          # days until resolution
+    gross_return: float  # e.g. 0.025 (2.5¢ net on 97.5¢ cost)
+    annualised_return: float  # e.g. 3.12 (312% annualised)
+    size_usd: float
+
+
+class BondScanner:
+    """
+    Finds near-certain contracts resolving soon.
+
+    A contract priced at 95¢ resolving in 3 days returns 5.2% in 72 hours —
+    312% annualised. No model uncertainty required: the edge is purely
+    time-value on a high-confidence outcome.
+
+    Criteria:
+    - Price in [min_price, max_price]  (default 90–97¢)
+    - Resolves within max_days         (default 14 days)
+    - Annualised return >= min_annualised (default 50%)
+    """
+
+    def __init__(
+        self,
+        min_price: float = 0.90,
+        max_price: float = 0.97,
+        max_days: float = 14.0,
+        min_annualised: float = 0.50,
+    ):
+        self.min_price = min_price
+        self.max_price = max_price
+        self.max_days = max_days
+        self.min_annualised = min_annualised
+
+    def scan(
+        self,
+        market_id: str,
+        question: str,
+        yes_price: float,
+        no_price: float,
+        days: float,
+        balance: float,
+        max_position_pct: float = 0.10,
+    ) -> Optional[BondResult]:
+        """Return BondResult if a near-certain opportunity exists, else None."""
+        if days <= 0 or days > self.max_days:
+            return None
+
+        for position, price in (("YES", yes_price), ("NO", no_price)):
+            if not (self.min_price <= price <= self.max_price):
+                continue
+
+            gross_return = 1.0 - price - (TAKER_FEE + SLIPPAGE)
+            if gross_return <= 0:
+                continue
+
+            annualised = (gross_return / price) * (365.0 / days)
+            if annualised < self.min_annualised:
+                continue
+
+            size_usd = round(balance * max_position_pct, 2)
+            return BondResult(
+                market_id=market_id,
+                question=question,
+                position=position,
+                price=price,
+                days=days,
+                gross_return=gross_return,
+                annualised_return=annualised,
+                size_usd=size_usd,
+            )
+
+        return None
+
+
+# ── Scanner 8: Longshot Fader ─────────────────────────────────────────────────
+
+@dataclass
+class LongshotResult:
+    market_id: str
+    question: str
+    yes_price: float      # the overpriced longshot
+    no_price: float       # what we buy
+    true_prob_yes: float  # model's estimate (discounted)
+    edge: float           # true_prob_no - no_price - fees
+    size_usd: float
+
+
+class LongshotFader:
+    """
+    Exploits the longshot bias on Polymarket.
+
+    Empirical research on 95M+ transactions shows contracts priced below 10¢
+    lose ~60% of invested capital on average. The market systematically
+    overprices low-probability events (consistent with prospect theory).
+
+    Adjustment: true_prob_yes = market_price * LONGSHOT_FACTOR (0.40)
+    — i.e. the true win rate is ~40% of the implied probability.
+
+    This creates edge on the NO side:
+      edge = (1 - true_prob_yes) - no_price - fees
+
+    Example: YES at 8¢ → true_prob_yes = 3.2% → NO edge ≈ 2.3%
+    """
+
+    LONGSHOT_FACTOR = 0.40  # true win rate as fraction of market-implied rate
+
+    def __init__(self, max_yes_price: float = 0.10, min_edge: float = 0.02):
+        self.max_yes_price = max_yes_price
+        self.min_edge = min_edge
+
+    def scan(
+        self,
+        market_id: str,
+        question: str,
+        yes_price: float,
+        no_price: float,
+        balance: float,
+        max_position_pct: float = 0.10,
+    ) -> Optional[LongshotResult]:
+        """Return LongshotResult if NO has edge from longshot bias, else None."""
+        if yes_price > self.max_yes_price or yes_price <= 0:
+            return None
+        if no_price <= 0:
+            return None
+
+        true_prob_yes = yes_price * self.LONGSHOT_FACTOR
+        true_prob_no  = 1.0 - true_prob_yes
+        fees = TAKER_FEE + SLIPPAGE
+        edge = true_prob_no - no_price - fees
+
+        if edge < self.min_edge:
+            return None
+
+        size_usd = round(balance * max_position_pct, 2)
+        return LongshotResult(
+            market_id=market_id,
+            question=question,
+            yes_price=yes_price,
+            no_price=no_price,
+            true_prob_yes=true_prob_yes,
+            edge=edge,
+            size_usd=size_usd,
         )
