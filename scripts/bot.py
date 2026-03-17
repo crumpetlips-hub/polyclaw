@@ -23,7 +23,7 @@ import os
 import signal
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +60,8 @@ MAX_POSITION_PCT   = 0.10   # max 10% of balance per trade
 MAX_DAILY_TRADES   = 10     # circuit breaker
 MAX_OPEN_POSITIONS = 5      # don't open more simultaneously
 ALERT_COOLDOWN_H   = 4      # hours before re-alerting same market
+LOSS_WINDOW_H      = 12    # rolling window for circuit breaker
+MAX_LOSSES         = 3     # losses within window that trip the breaker
 
 LOG_FILE = Path.home() / ".openclaw" / "logs" / "bot.log"
 
@@ -111,6 +113,12 @@ class TediumBot:
         # Persistent cooldown — survives restarts
         self._cooldown_file = Path.home() / ".openclaw" / "bot_cooldowns.json"
         self.last_alerted: dict[str, datetime] = self._load_cooldowns()
+
+        # Circuit breaker — pause if MAX_LOSSES losses in LOSS_WINDOW_H hours
+        self._loss_file = Path.home() / ".openclaw" / "bot_losses.json"
+        self._loss_timestamps: list[datetime] = self._load_losses()
+        self._breaker_tripped: bool = False
+        self._check_breaker()  # restore state from previous run
 
         mode = "LIVE 🔴" if live else "PAPER 📋"
         log.info(
@@ -211,6 +219,47 @@ class TediumBot:
     def _mark_alerted(self, key: str) -> None:
         self.last_alerted[key] = datetime.now(timezone.utc)
         self._save_cooldowns()
+
+    # ── Circuit breaker ───────────────────────────────────────────────────────
+
+    def _load_losses(self) -> list[datetime]:
+        try:
+            if self._loss_file.exists():
+                raw = json.loads(self._loss_file.read_text())
+                return [datetime.fromisoformat(ts) for ts in raw]
+        except Exception:
+            pass
+        return []
+
+    def _save_losses(self) -> None:
+        try:
+            self._loss_file.write_text(
+                json.dumps([ts.isoformat() for ts in self._loss_timestamps])
+            )
+        except Exception as e:
+            log.warning(f"Failed to save losses: {e}")
+
+    def _record_loss(self) -> None:
+        """Record a resolved loss and recheck the breaker."""
+        self._loss_timestamps.append(datetime.now(timezone.utc))
+        self._save_losses()
+        self._check_breaker()
+
+    def _check_breaker(self) -> bool:
+        """Prune expired losses and update breaker state. Returns True if tripped."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=LOSS_WINDOW_H)
+        self._loss_timestamps = [ts for ts in self._loss_timestamps if ts > cutoff]
+        self._save_losses()
+        was_tripped = self._breaker_tripped
+        self._breaker_tripped = len(self._loss_timestamps) >= MAX_LOSSES
+        if self._breaker_tripped and not was_tripped:
+            log.warning(
+                f"[BREAKER] {MAX_LOSSES} losses in {LOSS_WINDOW_H}h — trading PAUSED. "
+                f"Will auto-reset when oldest loss expires. Scanning continues."
+            )
+        elif not self._breaker_tripped and was_tripped:
+            log.info("[BREAKER] Reset — trading resumed.")
+        return self._breaker_tripped
 
     # ── Analysis pipeline ─────────────────────────────────────────────────────
 
@@ -535,6 +584,9 @@ class TediumBot:
         self._reset_daily()
         self._scan_count += 1
 
+        # Refresh breaker state (auto-resets as old losses expire)
+        self._check_breaker()
+
         # Every 10 scans (~10 min): check for resolved positions + recalibrate
         if self._scan_count % 10 == 0:
             newly_resolved = await self._check_resolved_positions()
@@ -552,6 +604,16 @@ class TediumBot:
             return
 
         log.info(f"Found {len(opportunities)} single-market + {len(multi_opps)} multi-outcome opportunities")
+
+        if self._breaker_tripped:
+            losses_str = ", ".join(
+                ts.strftime("%H:%M") for ts in sorted(self._loss_timestamps)
+            )
+            log.warning(
+                f"[BREAKER] Trading paused — {len(self._loss_timestamps)} losses in last {LOSS_WINDOW_H}h "
+                f"(at {losses_str} UTC). Scanning only."
+            )
+            return
 
         storage = PositionStorage()
 
@@ -642,6 +704,8 @@ class TediumBot:
                         f"strategy={outcome.strategy}"
                     )
                     newly_resolved += 1
+                    if not outcome.actual_win:
+                        self._record_loss()
             except Exception as e:
                 log.debug(f"Resolution check failed for {pos['market_id']}: {e}")
 

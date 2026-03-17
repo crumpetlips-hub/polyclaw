@@ -210,13 +210,14 @@ class TradeExecutor:
                     self.wallet.get_unlocked_key(),
                     self.wallet.address,
                 )
-                clob_order_id, clob_filled, clob_error = clob.sell_fok(
+                clob_order_id, clob_error = clob.sell_gtc(
                     unwanted_token,
                     amount,  # Same number of tokens as USDC spent
                     unwanted_price,
                 )
+                clob_filled = clob_order_id is not None
                 if clob_filled:
-                    print(f"CLOB sell filled: {clob_order_id}")
+                    print(f"CLOB limit sell posted: {clob_order_id} @ {round(max(unwanted_price - 0.01, 0.01), 2):.2f} (GTC, 0% fee)")
                 else:
                     print(f"CLOB sell failed: {clob_error}")
             except Exception as e:
