@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+Project Tedium Bot - Autonomous Polymarket scanner/trader.
+
+Six-model pipeline:
+  1. Bayesian    - probability from order book imbalance + correlated markets
+  2. Edge        - EV filter (q - p - c) and pure arb check
+  3. Spread      - z-score dislocation across related markets in an event
+  4. Stoikov     - passive (GTC) vs aggressive (FOK) execution decision
+  5. Kelly       - quarter-Kelly position sizing
+  6. Monte Carlo - stress test: skip if P(profitable) < 65%
+
+Usage:
+  uv run python scripts/bot.py            # paper mode (default)
+  uv run python scripts/bot.py --live     # real trades
+  uv run python scripts/bot.py --once     # one scan, then exit
+"""
+
+import asyncio
+import logging
+import os
+import signal
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+POLYCLAW_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(POLYCLAW_DIR))
+
+from dotenv import load_dotenv
+load_dotenv(POLYCLAW_DIR / ".env")
+
+from lib.gamma_client import GammaClient, Market
+from lib.clob_client import ClobClientWrapper
+from lib.wallet_manager import WalletManager
+from lib.position_storage import PositionStorage, PositionEntry
+from lib.models import (
+    BayesianModel, EdgeModel, SpreadModel,
+    StoikovModel, KellyModel, MonteCarloModel,
+)
+from scripts.trade import TradeExecutor
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+SCAN_INTERVAL      = 60     # seconds between scans
+SCAN_LIMIT         = 100    # markets per scan
+MIN_LIQUIDITY      = 1000   # skip markets below this USDC liquidity
+MIN_EDGE           = 0.02   # 2% minimum edge to trigger
+MAX_POSITION_PCT   = 0.10   # max 10% of balance per trade
+MAX_DAILY_TRADES   = 10     # circuit breaker
+MAX_OPEN_POSITIONS = 5      # don't open more simultaneously
+ALERT_COOLDOWN_H   = 4      # hours before re-alerting same market
+
+LOG_FILE = Path.home() / ".openclaw" / "logs" / "bot.log"
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("tedium-bot")
+
+
+# ── Bot ───────────────────────────────────────────────────────────────────────
+
+class TediumBot:
+
+    def __init__(self, live: bool = False):
+        self.live    = live
+        self.running = False
+
+        self.gamma  = GammaClient()
+        self.wallet = WalletManager()
+
+        self.bayesian    = BayesianModel()
+        self.edge_model  = EdgeModel(min_edge=MIN_EDGE)
+        self.spread      = SpreadModel(z_threshold=2.0)
+        self.stoikov     = StoikovModel()
+        self.kelly       = KellyModel(kelly_fraction=0.25)
+        self.monte_carlo = MonteCarloModel(scenarios=1000)
+
+        # CLOB client cached — auth happens once, not per market
+        self._clob: Optional[ClobClientWrapper] = None
+
+        self.daily_trades  = 0
+        self.day_start     = datetime.now(timezone.utc).date()
+        # market_key -> last alert time (UTC)
+        self.last_alerted: dict[str, datetime] = {}
+
+        mode = "LIVE 🔴" if live else "PAPER 📋"
+        log.info(f"TediumBot starting — {mode}")
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _reset_daily(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if today != self.day_start:
+            self.daily_trades = 0
+            self.day_start = today
+
+    def _balance(self) -> float:
+        try:
+            return self.wallet.get_balances().usdc_e
+        except Exception as e:
+            log.error(f"Balance check failed: {e}")
+            return 0.0
+
+    def _get_clob(self) -> Optional[ClobClientWrapper]:
+        """Return cached CLOB client, initialising once."""
+        if self._clob is None and self.wallet.is_unlocked:
+            try:
+                self._clob = ClobClientWrapper(
+                    self.wallet.get_unlocked_key(), self.wallet.address
+                )
+                # Trigger auth now so it's cached for the whole scan
+                _ = self._clob.client
+            except Exception as e:
+                log.warning(f"CLOB init failed: {e}")
+        return self._clob
+
+    def _order_book(self, token_id: str) -> Optional[dict]:
+        clob = self._get_clob()
+        if not clob or not token_id:
+            return None
+        try:
+            return clob.get_order_book(token_id)
+        except Exception:
+            return None
+
+    def _already_alerted(self, key: str) -> bool:
+        last = self.last_alerted.get(key)
+        if last is None:
+            return False
+        hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        return hours < ALERT_COOLDOWN_H
+
+    def _mark_alerted(self, key: str) -> None:
+        self.last_alerted[key] = datetime.now(timezone.utc)
+
+    # ── Analysis pipeline ─────────────────────────────────────────────────────
+
+    def _prefilter(self, market: Market, correlated_signal: Optional[float]) -> bool:
+        """Quick check using Gamma prices only — skip obvious non-starters."""
+        if market.closed or market.resolved or not market.active:
+            return False
+        if market.liquidity < MIN_LIQUIDITY:
+            return False
+        # Pure arb candidate: YES + NO don't sum to 1
+        fees = 0.025
+        if 1.0 - (market.yes_price + market.no_price) - fees >= MIN_EDGE:
+            return True
+        # Correlated signal suggests mispricing
+        if correlated_signal is not None:
+            if abs(correlated_signal - market.yes_price) >= MIN_EDGE:
+                return True
+        return False
+
+    def _analyze(
+        self,
+        market: Market,
+        balance: float,
+        correlated_signal: Optional[float] = None,
+    ) -> Optional[dict]:
+        """Run all 6 models on a market. Returns opportunity dict or None."""
+        if not self._prefilter(market, correlated_signal):
+            return None
+
+        # Model 1: Bayesian — order book fetch only for pre-filtered candidates
+        ob = self._order_book(market.yes_token_id)
+        model_prob = self.bayesian.estimate(
+            market_price=market.yes_price,
+            order_book=ob,
+            correlated_signal=correlated_signal,
+        )
+
+        # Model 2: Edge
+        edge = self.edge_model.calculate(
+            market_id=market.id,
+            question=market.question,
+            p_yes=market.yes_price,
+            p_no=market.no_price,
+            model_prob_yes=model_prob,
+        )
+        if edge is None:
+            return None
+
+        # Model 4: Stoikov
+        days = self.stoikov.days_to_resolution(market.end_date)
+        aggressive = self.stoikov.should_hit_aggressively(edge=edge.edge, days_to_resolution=days)
+
+        # Model 5: Kelly
+        kelly = self.kelly.size(
+            bankroll=balance,
+            win_prob=edge.model_prob,
+            market_price=edge.market_price,
+            max_position_pct=MAX_POSITION_PCT,
+        )
+        if kelly.size_usd < 1.0:
+            return None
+
+        # Model 6: Monte Carlo
+        mc = self.monte_carlo.stress_test(
+            win_prob=edge.model_prob,
+            market_price=edge.market_price,
+            position_size=kelly.size_usd,
+        )
+        if not mc.passed:
+            log.debug(f"MC fail: {market.question[:40]} ({mc.profitable_pct:.0%})")
+            return None
+
+        return {
+            "market": market,
+            "edge": edge,
+            "kelly": kelly,
+            "mc": mc,
+            "aggressive": aggressive,
+            "days": days,
+        }
+
+    async def _scan(self, balance: float) -> list[dict]:
+        """Fetch markets, run spread detection + individual analysis."""
+        opportunities: list[dict] = {}  # market_id -> best opp
+
+        # Model 3: Spread — scan event groups for dislocations
+        correlated: dict[str, float] = {}  # market_id -> signal
+        try:
+            events = await self.gamma.get_events(limit=20)
+            for event in events:
+                dislocations = self.spread.scan_event(event.markets)
+                for a, b, z, cheap in dislocations:
+                    log.info(f"Spread dislocation z={z:.2f}: '{event.title[:40]}'")
+                    # Signal: cheap market is underpriced relative to its peer
+                    correlated[cheap.id] = cheap.yes_price + abs(z) * 0.01
+        except Exception as e:
+            log.warning(f"Spread scan error: {e}")
+
+        # Individual market analysis
+        try:
+            markets = await self.gamma.get_trending_markets(limit=SCAN_LIMIT)
+            log.info(f"Scanning {len(markets)} markets (balance: ${balance:.2f})")
+
+            for market in markets:
+                signal = correlated.get(market.id)
+                opp = self._analyze(market, balance, correlated_signal=signal)
+                if opp:
+                    mid = market.id
+                    if mid not in opportunities or opp["edge"].edge > opportunities[mid]["edge"].edge:
+                        opportunities[mid] = opp
+        except Exception as e:
+            log.error(f"Market scan error: {e}")
+
+        return list(opportunities.values())
+
+    # ── Trade execution ───────────────────────────────────────────────────────
+
+    async def _execute(self, opp: dict) -> bool:
+        m, e, k = opp["market"], opp["edge"], opp["kelly"]
+        log.info(f"Executing: {e.position} on '{m.question[:50]}' ${k.size_usd:.2f}")
+        try:
+            executor = TradeExecutor(self.wallet)
+            result = await executor.buy_position(
+                market_id=m.id,
+                position=e.position,
+                amount=k.size_usd,
+            )
+            if result.success:
+                log.info(f"Trade executed: {e.position} ${k.size_usd:.2f} TX:{result.split_tx[:20]}")
+                return True
+            else:
+                log.error(f"Trade failed: {result.error}")
+                return False
+        except Exception as ex:
+            log.error(f"Trade exception: {ex}")
+            return False
+
+    def _alert(self, opp: dict) -> None:
+        e, k = opp["edge"], opp["kelly"]
+        exec_type = "FOK" if opp["aggressive"] else "GTC"
+        log.info(
+            f"Opportunity: {e.position} '{opp['market'].question[:50]}' "
+            f"edge={e.edge:.2%} size=${k.size_usd:.2f} {exec_type}"
+        )
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    async def run_once(self) -> None:
+        self._reset_daily()
+        balance = self._balance()
+        opportunities = await self._scan(balance)
+
+        if not opportunities:
+            log.info("No opportunities this scan.")
+            return
+
+        # Best edge first
+        opportunities.sort(key=lambda o: o["edge"].edge, reverse=True)
+        log.info(f"Found {len(opportunities)} opportunities")
+
+        storage = PositionStorage()
+
+        for opp in opportunities:
+            market_key = f"{opp['market'].id}_{opp['edge'].position}"
+
+            if self._already_alerted(market_key):
+                continue
+
+            if self.daily_trades >= MAX_DAILY_TRADES:
+                log.warning("Daily trade limit hit")
+                break
+
+            if len(storage.get_open()) >= MAX_OPEN_POSITIONS:
+                log.info("Max open positions reached")
+                break
+
+            self._alert(opp)
+            self._mark_alerted(market_key)
+
+            if self.live:
+                success = await self._execute(opp)
+                if success:
+                    self.daily_trades += 1
+            else:
+                log.info(
+                    f"[PAPER] {opp['edge'].position} '{opp['market'].question[:50]}' "
+                    f"edge={opp['edge'].edge:.2%} size=${opp['kelly'].size_usd:.2f}"
+                )
+
+    async def run(self) -> None:
+        self.running = True
+        while self.running:
+            try:
+                await self.run_once()
+            except Exception as e:
+                log.error(f"Loop error: {e}")
+            if self.running:
+                log.info(f"Next scan in {SCAN_INTERVAL}s")
+                await asyncio.sleep(SCAN_INTERVAL)
+
+    def stop(self) -> None:
+        log.info("Stopping...")
+        self.running = False
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Project Tedium Bot")
+    parser.add_argument("--live", action="store_true", help="Enable real trading")
+    parser.add_argument("--once", action="store_true", help="One scan cycle then exit")
+    args = parser.parse_args()
+
+    bot = TediumBot(live=args.live)
+
+    def _stop(sig, frame):
+        bot.stop()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    if args.once:
+        await bot.run_once()
+    else:
+        await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
