@@ -37,6 +37,7 @@ from lib.gamma_client import GammaClient, Market
 from lib.clob_client import ClobClientWrapper
 from lib.wallet_manager import WalletManager
 from lib.position_storage import PositionStorage, PositionEntry
+from lib.ws_client import PolymarketWSClient
 from lib.models import (
     BayesianModel, EdgeModel, SpreadModel,
     StoikovModel, KellyModel, MonteCarloModel,
@@ -64,6 +65,15 @@ MIN_BALANCE        = 5.0    # stop trading if balance drops below this
 ALERT_COOLDOWN_H   = 24     # hours before re-alerting same market
 LOSS_WINDOW_H      = 12     # rolling window for circuit breaker
 MAX_LOSSES         = 3      # losses within window that trip the breaker
+CATEGORY_CAP       = 0.30   # max 30% of balance in any single category
+TAKE_PROFIT_THRESH = 0.07   # take profit when position gains 7¢ (70% of typical bond return)
+MEAN_REVERT_THRESH = 0.05   # sports overreaction threshold (5¢ move in 60s)
+
+# Words that suggest ambiguous resolution criteria — skip these markets
+_AMBIGUOUS_TERMS = {
+    "substantially", "significantly", "at least", "approximately",
+    "around", "roughly", "major", "notable", "considerable",
+}
 
 LOG_FILE = Path.home() / ".openclaw" / "logs" / "bot.log"
 
@@ -121,6 +131,13 @@ class TediumBot:
         self._loss_timestamps: list[datetime] = self._load_losses()
         self._breaker_tripped: bool = False
         self._check_breaker()  # restore state from previous run
+
+        # WebSocket real-time order book (started in run())
+        self._ws = PolymarketWSClient()
+
+        # Price cache for overreaction/mean-reversion detection
+        # market_id → (last_yes_price, timestamp)
+        self._price_cache: dict[str, tuple[float, datetime]] = {}
 
         mode = "LIVE 🔴" if live else "PAPER 📋"
         log.info(
@@ -191,6 +208,12 @@ class TediumBot:
         return self._clob
 
     def _order_book(self, token_id: str) -> Optional[dict]:
+        # Try WebSocket cache first (<50ms latency, no REST cost)
+        if token_id and self._ws.connected:
+            cached = self._ws.get_order_book(token_id)
+            if cached:
+                return cached
+        # Fall back to REST
         clob = self._get_clob()
         if not clob or not token_id:
             return None
@@ -280,6 +303,10 @@ class TediumBot:
             return False
         if market.liquidity < MIN_LIQUIDITY:
             return False
+        # Resolution ambiguity filter — oracle manipulation risk
+        q_lower = market.question.lower()
+        if any(t in q_lower for t in _AMBIGUOUS_TERMS):
+            return False
         # Pure arb candidate: YES + NO don't sum to 1
         fees = 0.025
         if 1.0 - (market.yes_price + market.no_price) - fees >= MIN_EDGE:
@@ -300,12 +327,27 @@ class TediumBot:
         if not self._prefilter(market, correlated_signal):
             return None
 
+        # Subscribe this token to WebSocket for future real-time updates
+        if market.yes_token_id:
+            asyncio.ensure_future(self._ws.subscribe([market.yes_token_id]))
+
+        # Compute price change from cache for overreaction correction
+        now = datetime.now(timezone.utc)
+        price_change_24h = 0.0
+        if market.id in self._price_cache:
+            cached_price, cached_time = self._price_cache[market.id]
+            age_h = (now - cached_time).total_seconds() / 3600
+            if age_h > 0:
+                price_change_24h = market.yes_price - cached_price
+        self._price_cache[market.id] = (market.yes_price, now)
+
         # Model 1: Bayesian — order book fetch only for pre-filtered candidates
         ob = self._order_book(market.yes_token_id)
         model_prob = self.bayesian.estimate(
             market_price=market.yes_price,
             order_book=ob,
             correlated_signal=correlated_signal,
+            price_change_24h=price_change_24h,
         )
 
         # Model 2: Edge
@@ -360,6 +402,10 @@ class TediumBot:
             log.debug(f"Low agreement ({agreement}/5): {market.question[:40]}")
             return None
 
+        # Domain score: boost priority for categories where we're winning
+        cat_factor = self._category_kelly_factor(market.question)
+        domain_score = edge.edge * cat_factor  # higher in categories we're good at
+
         return {
             "market": market,
             "edge": edge,
@@ -367,6 +413,7 @@ class TediumBot:
             "mc": mc,
             "aggressive": aggressive,
             "days": days,
+            "domain_score": domain_score,
         }
 
     def _bond_opp(self, market: Market, balance: float) -> Optional[dict]:
@@ -444,7 +491,130 @@ class TediumBot:
             "mc": None, "aggressive": False, "days": days,
             "strategy": "longshot",
             "yes_price": result.yes_price,
+            "domain_score": result.edge * self._category_kelly_factor(market.question),
         }
+
+    def _mean_reversion_opp(self, market: Market, balance: float) -> Optional[dict]:
+        """
+        Sports overreaction fader (strategy 5).
+
+        If a sports market's price moved >5¢ since last scan, the move is likely
+        an overreaction. Fade it: bet against the direction of movement.
+        Academic backing: ScienceDirect 2019 (73% win rate documented).
+        """
+        if market.closed or market.resolved or not market.active:
+            return None
+        cat = category_of(market.question)
+        if cat != "sports":
+            return None
+        if market.id not in self._price_cache:
+            return None
+
+        cached_price, cached_time = self._price_cache[market.id]
+        age_s = (datetime.now(timezone.utc) - cached_time).total_seconds()
+        if age_s > 180:  # only flag moves within last 3 minutes
+            return None
+
+        price_move = market.yes_price - cached_price
+        if abs(price_move) < MEAN_REVERT_THRESH:
+            return None
+
+        # Fade the move: if YES jumped, buy NO; if YES dropped, buy YES
+        if price_move > 0:
+            position = "NO"
+            entry_price = market.no_price
+        else:
+            position = "YES"
+            entry_price = market.yes_price
+
+        # Edge: the overreaction is expected to revert ~70% of the way
+        expected_revert = abs(price_move) * 0.60
+        fees = TAKER_FEE + SLIPPAGE
+        edge_val = expected_revert - fees
+        if edge_val < MIN_EDGE:
+            return None
+
+        from lib.models import EdgeResult, KellyResult
+        edge = EdgeResult(
+            market_id=market.id,
+            question=market.question,
+            position=position,
+            market_price=entry_price,
+            model_prob=min(0.75, 0.50 + abs(price_move)),
+            edge=edge_val,
+            pure_arb=0.0,
+            fees=fees,
+        )
+        kelly = self.kelly.size(
+            bankroll=balance,
+            win_prob=edge.model_prob,
+            market_price=edge.market_price,
+            max_position_pct=MAX_POSITION_PCT * 0.6,  # smaller size for mean-reversion
+        )
+        if kelly.size_usd < 1.0:
+            return None
+        return {
+            "market": market, "edge": edge, "kelly": kelly,
+            "mc": None, "aggressive": True,
+            "days": self.stoikov.days_to_resolution(market.end_date),
+            "strategy": "mean_reversion",
+            "price_move": price_move,
+            "domain_score": edge_val,
+        }
+
+    async def _check_take_profit(self) -> int:
+        """
+        Check open positions for take-profit opportunities.
+        If current price is >= entry + TAKE_PROFIT_THRESH, post a limit sell.
+        Returns count of positions closed.
+        """
+        clob = self._get_clob()
+        if not clob:
+            return 0
+
+        closed = 0
+        for pos in self.storage.get_open():
+            try:
+                token_id    = pos.get("token_id", "")
+                entry_price = float(pos.get("entry_price", 0.5))
+                entry_amount = float(pos.get("entry_amount", 0))
+                position_id = pos.get("position_id", "")
+                side        = pos.get("position", "YES")
+
+                if not token_id:
+                    continue
+
+                # Get current price
+                market = await self.gamma.get_market(pos["market_id"])
+                current = market.yes_price if side == "YES" else market.no_price
+
+                if current - entry_price >= TAKE_PROFIT_THRESH:
+                    tokens = entry_amount / entry_price if entry_price > 0 else 0
+                    if self.live:
+                        order_id, err = clob.sell_gtc(token_id, tokens, current)
+                        if order_id:
+                            self.storage.update_status(position_id, "closed")
+                            self.storage.update_notes(
+                                position_id,
+                                f"take_profit @ {current:.2f} (entry {entry_price:.2f})"
+                            )
+                            log.info(
+                                f"[TAKE PROFIT] {side} '{pos['question'][:45]}' "
+                                f"{entry_price:.2f}→{current:.2f} "
+                                f"(+{current - entry_price:.2f}) order={order_id}"
+                            )
+                            closed += 1
+                        else:
+                            log.debug(f"Take-profit sell failed: {err}")
+                    else:
+                        log.info(
+                            f"[PAPER TAKE PROFIT] {side} '{pos['question'][:45]}' "
+                            f"{entry_price:.2f}→{current:.2f}"
+                        )
+            except Exception as e:
+                log.debug(f"Take-profit check error: {e}")
+
+        return closed
 
     async def _scan(self, balance: float) -> tuple[list[dict], list]:
         """Fetch markets and run all scanners.
@@ -495,8 +665,11 @@ class TediumBot:
                 # Longshot fader (YES < 10¢, buy NO)
                 ls = self._longshot_opp(market, balance)
 
+                # Mean-reversion sports overreaction fader
+                mr = self._mean_reversion_opp(market, balance)
+
                 # Keep best opportunity per market (highest edge wins)
-                for candidate in (opp, bond, ls):
+                for candidate in (opp, bond, ls, mr):
                     if candidate is None:
                         continue
                     mid = market.id
@@ -623,6 +796,9 @@ class TediumBot:
                 new_params = self._calib_engine.calibrate()
                 self._apply_calibration(new_params)
 
+        # Check open positions for take-profit opportunities
+        await self._check_take_profit()
+
         balance = self._balance()
         opportunities, multi_opps = await self._scan(balance)
 
@@ -675,7 +851,8 @@ class TediumBot:
                 scan_trades += len(multi.legs)
 
         # ── Single-market opportunities ───────────────────────────────────────
-        opportunities.sort(key=lambda o: o["edge"].edge, reverse=True)
+        # Sort by domain_score (edge × category_kelly_factor) — prioritise categories we win in
+        opportunities.sort(key=lambda o: o.get("domain_score", o["edge"].edge), reverse=True)
 
         # Build event fingerprints from existing open positions to avoid
         # trading multiple legs of the same underlying event
@@ -709,6 +886,20 @@ class TediumBot:
                 log.debug(f"Skipping duplicate event: '{opp['market'].question[:50]}'")
                 continue
 
+            # Category concentration cap — max 30% of balance in any one category
+            cat = category_of(opp["market"].question)
+            cat_exposure = sum(
+                float(p.get("entry_amount", 0))
+                for p in storage.get_open()
+                if category_of(p.get("question", "")) == cat
+            )
+            if cat_exposure + opp["kelly"].size_usd > balance * CATEGORY_CAP:
+                log.info(
+                    f"[CAP] Skipping '{opp['market'].question[:45]}' — "
+                    f"{cat} exposure ${cat_exposure:.2f} already at cap"
+                )
+                continue
+
             self._alert(opp)
             self._mark_alerted(market_key)
             open_fingerprints.add(fp)
@@ -727,6 +918,19 @@ class TediumBot:
 
     async def run(self) -> None:
         self.running = True
+
+        # Start WebSocket for real-time order book updates
+        await self._ws.start()
+
+        # Subscribe existing open positions immediately
+        open_token_ids = [
+            p["token_id"] for p in self.storage.get_open()
+            if p.get("token_id")
+        ]
+        if open_token_ids:
+            await self._ws.subscribe(open_token_ids)
+            log.info(f"[WS] Subscribed to {len(open_token_ids)} open position tokens")
+
         while self.running:
             try:
                 await self.run_once()
@@ -773,6 +977,7 @@ class TediumBot:
     def stop(self) -> None:
         log.info("Stopping...")
         self.running = False
+        asyncio.ensure_future(self._ws.stop())
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

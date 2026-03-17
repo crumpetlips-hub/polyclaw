@@ -70,6 +70,10 @@ class TradeOutcome:
     actual_win: bool
     actual_pnl: float         # USDC profit/loss
     resolved_at: str          # ISO timestamp
+    closing_price: float = 0.0  # market price at resolution — used for CLV
+    clv: float = 0.0            # Closing Line Value: entry_price - closing_price
+                                # Positive = we got in before market moved our way (edge)
+                                # Negative = we got in late (noise trading)
 
 
 @dataclass
@@ -339,11 +343,17 @@ class CalibrationEngine:
 
     def _write_self_report(self, params: CalibrationParams, records: list[dict]) -> None:
         """Write a human-readable performance summary the bot reads at startup."""
+        # Closing Line Value summary
+        clv_records = [r for r in records if r.get("clv", 0) != 0]
+        avg_clv = sum(r.get("clv", 0) for r in clv_records) / len(clv_records) if clv_records else 0
+        clv_verdict = "GENUINE EDGE ✓" if avg_clv > 0 else ("NO EDGE ✗" if clv_records else "no data yet")
+
         lines = [
             "=== Bobbot Self-Report ===",
             f"Generated: {params.last_calibrated}",
             f"Total resolved: {params.total_resolved}",
             f"Maturity level: {params.maturity_edge_boost:.0%} edge boost",
+            f"Avg CLV: {avg_clv:+.4f} — {clv_verdict}",
             "",
             "--- Strategy Performance ---",
         ]
@@ -431,6 +441,10 @@ def record_resolved_position(position: dict, market) -> Optional[TradeOutcome]:
     """
     Build a TradeOutcome from a resolved position and its market data.
     Returns None if outcome can't be determined.
+
+    CLV (Closing Line Value) measures whether our entry beat the closing price.
+    Positive CLV = we got in before the market moved our way = genuine edge.
+    Negative CLV = we entered late = noise trading.
     """
     from datetime import datetime, timezone
 
@@ -440,11 +454,17 @@ def record_resolved_position(position: dict, market) -> Optional[TradeOutcome]:
 
     pos_side = position.get("position", "YES")
     if pos_side == "YES":
-        actual_win = outcome_str.startswith("y")
+        actual_win   = outcome_str.startswith("y")
+        closing_price = market.yes_price  # final market price before resolution
+        entry_price  = float(position.get("entry_price", 0.5))
+        # CLV: positive if we entered below the closing price (market moved our way)
+        clv = closing_price - entry_price
     else:
-        actual_win = outcome_str.startswith("n")
+        actual_win    = outcome_str.startswith("n")
+        closing_price = market.no_price
+        entry_price   = float(position.get("entry_price", 0.5))
+        clv = closing_price - entry_price
 
-    entry_price  = float(position.get("entry_price", 0.5))
     entry_amount = float(position.get("entry_amount", 0))
 
     if actual_win:
@@ -465,4 +485,6 @@ def record_resolved_position(position: dict, market) -> Optional[TradeOutcome]:
         actual_win=actual_win,
         actual_pnl=round(actual_pnl, 4),
         resolved_at=datetime.now(timezone.utc).isoformat(),
+        closing_price=round(closing_price, 4),
+        clv=round(clv, 4),
     )

@@ -64,29 +64,51 @@ class BayesianModel:
     P(H|D) = P(D|H) * P(H) / P(D)
 
     Updates the market price (prior) with:
-    - Order book imbalance (bid vs ask depth at top 5 levels)
-    - Correlated market signal (from spread model, when a related market reprices)
+    - Order book imbalance (volume-weighted bid vs ask)
+    - Large-order smart money signal (>$200 at a single level)
+    - Overreaction/mean-reversion correction (academic-backed)
+    - Correlated market signal (from spread model)
     """
 
     def __init__(self, imbalance_weight: float = 0.3, correlation_weight: float = 0.4):
-        self.imbalance_weight = imbalance_weight
+        self.imbalance_weight  = imbalance_weight
         self.correlation_weight = correlation_weight
+        # Overreaction correction: fade strong trends
+        self.overreaction_weight = 0.10
+        # Smart money weight: large orders near mid
+        self.smart_money_weight = 0.08
 
     def estimate(
         self,
         market_price: float,
         order_book: Optional[dict] = None,
         correlated_signal: Optional[float] = None,
+        price_change_24h: float = 0.0,
     ) -> float:
         """Return posterior probability estimate in [0.01, 0.99]."""
         posterior = market_price
 
         if order_book:
+            # Volume-weighted order imbalance
             imbalance = self._imbalance(order_book)
             if imbalance > 0:
                 posterior += self.imbalance_weight * imbalance * (1 - posterior)
             else:
                 posterior += self.imbalance_weight * imbalance * posterior
+
+            # Smart money: large resting orders signal informed buyers/sellers
+            smart = self._smart_money_signal(order_book, market_price)
+            if smart != 0:
+                if smart > 0:
+                    posterior += self.smart_money_weight * smart * (1 - posterior)
+                else:
+                    posterior += self.smart_money_weight * smart * posterior
+
+        # Overreaction correction: markets that moved strongly tend to revert
+        # (ScienceDirect 2019, 6,058 markets: rising prices underestimate prob)
+        if abs(price_change_24h) > 0.10:
+            correction = -self.overreaction_weight * (price_change_24h / abs(price_change_24h))
+            posterior += correction * abs(price_change_24h - 0.10)
 
         if correlated_signal is not None:
             posterior = (
@@ -97,14 +119,45 @@ class BayesianModel:
         return max(0.01, min(0.99, posterior))
 
     def _imbalance(self, order_book: dict) -> float:
-        """Order book imbalance in [-1, 1]. Positive = buy pressure."""
+        """Volume-weighted order book imbalance in [-1, 1]."""
         try:
             bids = order_book.get("bids", [])
             asks = order_book.get("asks", [])
-            bid_size = sum(float(b.get("size", 0)) for b in bids[:5])
-            ask_size = sum(float(a.get("size", 0)) for a in asks[:5])
-            total = bid_size + ask_size
-            return (bid_size - ask_size) / total if total > 0 else 0.0
+            bid_vol = sum(float(b.get("price", 0)) * float(b.get("size", 0)) for b in bids[:5])
+            ask_vol = sum(float(a.get("price", 0)) * float(a.get("size", 0)) for a in asks[:5])
+            total = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total if total > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _smart_money_signal(self, order_book: dict, market_price: float) -> float:
+        """
+        Detect large resting orders near the mid — proxy for informed/institutional traders.
+        Returns +1 if large buy pressure, -1 if large sell pressure, 0 if unclear.
+        """
+        try:
+            LARGE_ORDER_USD = 200.0
+            NEAR_MID_PCT    = 0.05  # within 5% of current price
+
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
+
+            large_bid = any(
+                float(b.get("price", 0)) * float(b.get("size", 0)) >= LARGE_ORDER_USD
+                and abs(float(b.get("price", 0)) - market_price) / market_price <= NEAR_MID_PCT
+                for b in bids[:3]
+            )
+            large_ask = any(
+                float(a.get("price", 0)) * float(a.get("size", 0)) >= LARGE_ORDER_USD
+                and abs(float(a.get("price", 0)) - market_price) / market_price <= NEAR_MID_PCT
+                for a in asks[:3]
+            )
+
+            if large_bid and not large_ask:
+                return 1.0
+            if large_ask and not large_bid:
+                return -1.0
+            return 0.0
         except Exception:
             return 0.0
 
