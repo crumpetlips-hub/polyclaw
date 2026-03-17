@@ -56,12 +56,14 @@ SCAN_INTERVAL      = 60     # seconds between scans
 SCAN_LIMIT         = 100    # markets per scan
 MIN_LIQUIDITY      = 1000   # skip markets below this USDC liquidity
 MIN_EDGE           = 0.02   # 2% minimum edge to trigger
-MAX_POSITION_PCT   = 0.10   # max 10% of balance per trade
-MAX_DAILY_TRADES   = 10     # circuit breaker
+MAX_POSITION_PCT   = 0.05   # max 5% of balance per trade
+MAX_DAILY_TRADES   = 10     # daily trade cap
 MAX_OPEN_POSITIONS = 5      # don't open more simultaneously
-ALERT_COOLDOWN_H   = 4      # hours before re-alerting same market
-LOSS_WINDOW_H      = 12    # rolling window for circuit breaker
-MAX_LOSSES         = 3     # losses within window that trip the breaker
+MAX_TRADES_PER_SCAN = 2     # max new trades per scan cycle
+MIN_BALANCE        = 5.0    # stop trading if balance drops below this
+ALERT_COOLDOWN_H   = 24     # hours before re-alerting same market
+LOSS_WINDOW_H      = 12     # rolling window for circuit breaker
+MAX_LOSSES         = 3      # losses within window that trip the breaker
 
 LOG_FILE = Path.home() / ".openclaw" / "logs" / "bot.log"
 
@@ -134,7 +136,7 @@ class TediumBot:
         self.edge_model   = EdgeModel(min_edge=c.edge_min_edge)
         self.kelly        = KellyModel(kelly_fraction=0.25)  # base; per-strategy pct applied at call site
         self.bond_scanner = BondScanner(
-            min_price=0.90, max_price=0.97, max_days=14,
+            min_price=0.90, max_price=0.97, min_days=2.0, max_days=14,
             min_annualised=c.bond_min_annualised,
         )
         self.ls_fader = LongshotFader(
@@ -615,10 +617,18 @@ class TediumBot:
             )
             return
 
+        if balance < MIN_BALANCE:
+            log.warning(f"[FLOOR] Balance ${balance:.2f} below minimum ${MIN_BALANCE:.2f} — trading paused.")
+            return
+
         storage = PositionStorage()
 
         # ── Multi-outcome arbs first (highest certainty) ──────────────────────
+        scan_trades = 0
         for key, multi in multi_opps:
+            if scan_trades >= MAX_TRADES_PER_SCAN:
+                log.info(f"Per-scan trade limit reached, deferring multi-arb")
+                break
             if self.daily_trades + len(multi.legs) > MAX_DAILY_TRADES:
                 log.warning("Daily trade limit would be exceeded by multi-arb, skipping")
                 break
@@ -633,11 +643,21 @@ class TediumBot:
             if self.live:
                 filled = await self._execute_multi(multi)
                 log.info(f"Multi-arb: {filled}/{len(multi.legs)} legs filled")
+                scan_trades += filled
             else:
                 log.info(f"[PAPER] Multi-arb would execute {len(multi.legs)} legs, exposure=${multi.total_exposure:.2f}")
+                scan_trades += len(multi.legs)
 
         # ── Single-market opportunities ───────────────────────────────────────
         opportunities.sort(key=lambda o: o["edge"].edge, reverse=True)
+
+        # Build event fingerprints from existing open positions to avoid
+        # trading multiple legs of the same underlying event
+        open_fingerprints: set[str] = {
+            _event_fingerprint(p["question"])
+            for p in storage.get_open()
+        }
+        scan_trades = 0  # trades placed this scan cycle
 
         for opp in opportunities:
             market_key = f"{opp['market'].id}_{opp['edge'].position}"
@@ -649,22 +669,35 @@ class TediumBot:
                 log.warning("Daily trade limit hit")
                 break
 
+            if scan_trades >= MAX_TRADES_PER_SCAN:
+                log.info(f"Per-scan trade limit ({MAX_TRADES_PER_SCAN}) reached")
+                break
+
             if len(storage.get_open()) >= MAX_OPEN_POSITIONS:
                 log.info("Max open positions reached")
                 break
 
+            # Same-event deduplication
+            fp = _event_fingerprint(opp["market"].question)
+            if fp in open_fingerprints:
+                log.debug(f"Skipping duplicate event: '{opp['market'].question[:50]}'")
+                continue
+
             self._alert(opp)
             self._mark_alerted(market_key)
+            open_fingerprints.add(fp)
 
             if self.live:
                 success = await self._execute(opp)
                 if success:
                     self.daily_trades += 1
+                    scan_trades += 1
             else:
                 log.info(
                     f"[PAPER] {opp['edge'].position} '{opp['market'].question[:50]}' "
                     f"edge={opp['edge'].edge:.2%} size=${opp['kelly'].size_usd:.2f}"
                 )
+                scan_trades += 1
 
     async def run(self) -> None:
         self.running = True
@@ -714,6 +747,14 @@ class TediumBot:
     def stop(self) -> None:
         log.info("Stopping...")
         self.running = False
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _event_fingerprint(question: str) -> str:
+    """First 4 words of a question, lowercased — used to detect same-event markets."""
+    words = question.lower().split()
+    return " ".join(words[:4])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

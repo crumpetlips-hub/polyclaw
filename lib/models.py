@@ -377,11 +377,13 @@ class BondScanner:
         self,
         min_price: float = 0.90,
         max_price: float = 0.97,
+        min_days: float = 2.0,
         max_days: float = 14.0,
         min_annualised: float = 0.50,
     ):
         self.min_price = min_price
         self.max_price = max_price
+        self.min_days = min_days
         self.max_days = max_days
         self.min_annualised = min_annualised
 
@@ -396,7 +398,7 @@ class BondScanner:
         max_position_pct: float = 0.10,
     ) -> Optional[BondResult]:
         """Return BondResult if a near-certain opportunity exists, else None."""
-        if days <= 0 or days > self.max_days:
+        if days < self.min_days or days > self.max_days:
             return None
 
         for position, price in (("YES", yes_price), ("NO", no_price)):
