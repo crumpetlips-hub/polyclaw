@@ -495,3 +495,120 @@ class LongshotFader:
             edge=edge,
             size_usd=size_usd,
         )
+
+
+# ── Scanner 9: Multi-Outcome Overround ────────────────────────────────────────
+
+@dataclass
+class MultiOutcomeLeg:
+    market_id: str
+    question: str
+    yes_token_id: str
+    condition_id: str
+    yes_price: float
+    size_usd: float   # proportional share of total capital
+
+
+@dataclass
+class MultiOutcomeResult:
+    event_title: str
+    legs: list           # list[MultiOutcomeLeg]
+    total_yes: float     # sum of YES prices (< 1.00 = underround)
+    total_exposure: float
+    guaranteed_payout: float  # total_exposure / total_yes
+    edge_pct: float      # net profit / total_exposure after fees
+
+
+class MultiOutcomeScanner:
+    """
+    Finds events where YES prices across all outcomes sum to less than $1.00.
+
+    Since exactly one outcome must resolve YES, buying YES in every market
+    in the correct proportions guarantees a fixed payout regardless of result.
+
+    Proportional sizing: invest (price_i / sum) * capital in market i.
+    This gives equal token count across all legs, so payout is identical
+    no matter which outcome wins.
+
+    Example:
+      3-way "who wins" market: [0.40, 0.35, 0.20] → sum = 0.95
+      Invest $9.50 total ($4.00, $3.50, $2.00 per leg)
+      Guaranteed payout = $10.00 → gross profit 5.3% before fees
+
+    Safety bounds:
+      min_sum = 0.85  — below this, likely missing outcomes (not exhaustive)
+      max_sum = 0.985 — above this, fees consume the edge
+    """
+
+    def __init__(
+        self,
+        min_edge: float = 0.02,
+        min_sum: float = 0.85,
+        max_sum: float = 0.985,
+        min_leg_liquidity: float = 500.0,
+    ):
+        self.min_edge = min_edge
+        self.min_sum = min_sum
+        self.max_sum = max_sum
+        self.min_leg_liquidity = min_leg_liquidity
+
+    def scan(
+        self,
+        event_title: str,
+        markets: list,
+        balance: float,
+        max_position_pct: float = 0.10,
+    ) -> Optional[MultiOutcomeResult]:
+        """Return MultiOutcomeResult if a guaranteed-profit arb exists, else None."""
+        active = [
+            m for m in markets
+            if m.active and not m.closed and not m.resolved
+            and m.yes_token_id
+            and m.liquidity >= self.min_leg_liquidity
+        ]
+        if len(active) < 2:
+            return None
+
+        yes_prices = [m.yes_price for m in active]
+        total_yes = sum(yes_prices)
+
+        if not (self.min_sum <= total_yes <= self.max_sum):
+            return None
+
+        n = len(active)
+        total_capital = balance * max_position_pct
+
+        # Guaranteed payout: total_capital / total_yes
+        payout = total_capital / total_yes
+
+        # Fees applied on each leg's payout share
+        total_fees = n * (TAKER_FEE + SLIPPAGE) * (payout / n)
+        net_profit = payout - total_capital - total_fees
+        edge_pct = net_profit / total_capital
+
+        if edge_pct < self.min_edge:
+            return None
+
+        # Proportional per-leg sizes
+        legs = []
+        for m, price in zip(active, yes_prices):
+            size = round(total_capital * price / total_yes, 2)
+            if size < 1.0:
+                return None  # leg too small to execute
+            legs.append(MultiOutcomeLeg(
+                market_id=m.id,
+                question=m.question,
+                yes_token_id=m.yes_token_id,
+                condition_id=m.condition_id,
+                yes_price=price,
+                size_usd=size,
+            ))
+
+        return MultiOutcomeResult(
+            event_title=event_title,
+            legs=legs,
+            total_yes=total_yes,
+            total_exposure=total_capital,
+            guaranteed_payout=round(payout, 4),
+            edge_pct=edge_pct,
+        )

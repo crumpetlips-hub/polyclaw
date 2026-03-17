@@ -39,7 +39,7 @@ from lib.position_storage import PositionStorage, PositionEntry
 from lib.models import (
     BayesianModel, EdgeModel, SpreadModel,
     StoikovModel, KellyModel, MonteCarloModel,
-    BondScanner, LongshotFader,
+    BondScanner, LongshotFader, MultiOutcomeScanner,
     TAKER_FEE, SLIPPAGE,
 )
 from scripts.trade import TradeExecutor
@@ -90,8 +90,9 @@ class TediumBot:
         self.stoikov      = StoikovModel()
         self.kelly        = KellyModel(kelly_fraction=0.25)
         self.monte_carlo  = MonteCarloModel(scenarios=1000)
-        self.bond_scanner = BondScanner(min_price=0.90, max_price=0.97, max_days=14, min_annualised=0.50)
-        self.ls_fader     = LongshotFader(max_yes_price=0.10, min_edge=MIN_EDGE)
+        self.bond_scanner  = BondScanner(min_price=0.90, max_price=0.97, max_days=14, min_annualised=0.50)
+        self.ls_fader      = LongshotFader(max_yes_price=0.10, min_edge=MIN_EDGE)
+        self.multi_scanner = MultiOutcomeScanner(min_edge=MIN_EDGE)
 
         # CLOB client cached — auth happens once, not per market
         self._clob: Optional[ClobClientWrapper] = None
@@ -308,22 +309,38 @@ class TediumBot:
             "yes_price": result.yes_price,
         }
 
-    async def _scan(self, balance: float) -> list[dict]:
-        """Fetch markets, run spread detection + individual analysis."""
-        opportunities: list[dict] = {}  # market_id -> best opp
+    async def _scan(self, balance: float) -> tuple[list[dict], list]:
+        """Fetch markets and run all scanners.
 
-        # Model 3: Spread — scan event groups for dislocations
-        correlated: dict[str, float] = {}  # market_id -> signal
+        Returns:
+            (single_market_opportunities, multi_outcome_results)
+        """
+        opportunities: dict[str, dict] = {}  # market_id -> best single-market opp
+        multi_opps: list = []                # MultiOutcomeResult list
+
+        # Model 3: Spread + multi-outcome scanner — both use event groups
+        correlated: dict[str, float] = {}
         try:
-            events = await self.gamma.get_events(limit=20)
+            events = await self.gamma.get_events(limit=50)
             for event in events:
-                dislocations = self.spread.scan_event(event.markets)
-                for a, b, z, cheap in dislocations:
-                    log.info(f"Spread dislocation z={z:.2f}: '{event.title[:40]}'")
-                    # Signal: cheap market is underpriced relative to its peer
+                # Spread dislocation signals
+                for a, b, z, cheap in self.spread.scan_event(event.markets):
+                    log.info(f"Spread z={z:.2f}: '{event.title[:40]}'")
                     correlated[cheap.id] = cheap.yes_price + abs(z) * 0.01
+
+                # Multi-outcome overround arb
+                multi = self.multi_scanner.scan(
+                    event_title=event.title,
+                    markets=event.markets,
+                    balance=balance,
+                    max_position_pct=MAX_POSITION_PCT,
+                )
+                if multi:
+                    key = f"multi_{event.id}"
+                    if not self._already_alerted(key):
+                        multi_opps.append((key, multi))
         except Exception as e:
-            log.warning(f"Spread scan error: {e}")
+            log.warning(f"Event scan error: {e}")
 
         # Individual market analysis + specialist scanners
         try:
@@ -352,7 +369,7 @@ class TediumBot:
         except Exception as e:
             log.error(f"Market scan error: {e}")
 
-        return list(opportunities.values())
+        return list(opportunities.values()), multi_opps
 
     # ── Trade execution ───────────────────────────────────────────────────────
 
@@ -375,6 +392,28 @@ class TediumBot:
         except Exception as ex:
             log.error(f"Trade exception: {ex}")
             return False
+
+    async def _execute_multi(self, result) -> int:
+        """Execute all legs of a multi-outcome arb. Returns number of legs filled."""
+        filled = 0
+        for leg in result.legs:
+            log.info(f"  [MULTI leg] YES '{leg.question[:50]}' ${leg.size_usd:.2f}")
+            try:
+                executor = TradeExecutor(self.wallet)
+                trade = await executor.buy_position(
+                    market_id=leg.market_id,
+                    position="YES",
+                    amount=leg.size_usd,
+                )
+                if trade.success:
+                    log.info(f"  Leg filled TX:{trade.split_tx[:20]}")
+                    filled += 1
+                    self.daily_trades += 1
+                else:
+                    log.error(f"  Leg failed: {trade.error}")
+            except Exception as ex:
+                log.error(f"  Leg exception: {ex}")
+        return filled
 
     def _alert(self, opp: dict) -> None:
         e, k = opp["edge"], opp["kelly"]
@@ -403,17 +442,38 @@ class TediumBot:
     async def run_once(self) -> None:
         self._reset_daily()
         balance = self._balance()
-        opportunities = await self._scan(balance)
+        opportunities, multi_opps = await self._scan(balance)
 
-        if not opportunities:
+        total_found = len(opportunities) + len(multi_opps)
+        if not total_found:
             log.info("No opportunities this scan.")
             return
 
-        # Best edge first
-        opportunities.sort(key=lambda o: o["edge"].edge, reverse=True)
-        log.info(f"Found {len(opportunities)} opportunities")
+        log.info(f"Found {len(opportunities)} single-market + {len(multi_opps)} multi-outcome opportunities")
 
         storage = PositionStorage()
+
+        # ── Multi-outcome arbs first (highest certainty) ──────────────────────
+        for key, multi in multi_opps:
+            if self.daily_trades + len(multi.legs) > MAX_DAILY_TRADES:
+                log.warning("Daily trade limit would be exceeded by multi-arb, skipping")
+                break
+
+            log.info(
+                f"[MULTI-ARB] '{multi.event_title[:50]}' "
+                f"{len(multi.legs)} legs | sum={multi.total_yes:.3f} | "
+                f"edge={multi.edge_pct:.2%} | payout=${multi.guaranteed_payout:.2f}"
+            )
+            self._mark_alerted(key)
+
+            if self.live:
+                filled = await self._execute_multi(multi)
+                log.info(f"Multi-arb: {filled}/{len(multi.legs)} legs filled")
+            else:
+                log.info(f"[PAPER] Multi-arb would execute {len(multi.legs)} legs, exposure=${multi.total_exposure:.2f}")
+
+        # ── Single-market opportunities ───────────────────────────────────────
+        opportunities.sort(key=lambda o: o["edge"].edge, reverse=True)
 
         for opp in opportunities:
             market_key = f"{opp['market'].id}_{opp['edge'].position}"
