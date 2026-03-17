@@ -44,6 +44,10 @@ from lib.models import (
     TAKER_FEE, SLIPPAGE,
 )
 from scripts.trade import TradeExecutor
+from lib.calibrator import (
+    CalibrationEngine, PerformanceStore, CalibrationParams,
+    record_resolved_position, category_of,
+)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -85,15 +89,16 @@ class TediumBot:
         self.gamma  = GammaClient()
         self.wallet = WalletManager()
 
+        # Calibration — load persisted params first, then build models from them
+        self._calib_engine = CalibrationEngine()
+        self._perf_store   = PerformanceStore()
+        self.calib         = self._calib_engine.load_params()
+
         self.bayesian     = BayesianModel()
-        self.edge_model   = EdgeModel(min_edge=MIN_EDGE)
         self.spread       = SpreadModel(z_threshold=2.0)
         self.stoikov      = StoikovModel()
-        self.kelly        = KellyModel(kelly_fraction=0.25)
         self.monte_carlo  = MonteCarloModel(scenarios=1000)
-        self.bond_scanner  = BondScanner(min_price=0.90, max_price=0.97, max_days=14, min_annualised=0.50)
-        self.ls_fader      = LongshotFader(max_yes_price=0.10, min_edge=MIN_EDGE)
-        self.multi_scanner = MultiOutcomeScanner(min_edge=MIN_EDGE)
+        self._init_models()  # builds edge/kelly/bond/longshot/multi from calib params
 
         # CLOB client cached — auth happens once, not per market
         self._clob: Optional[ClobClientWrapper] = None
@@ -101,13 +106,47 @@ class TediumBot:
         self.daily_trades  = 0
         self.day_start     = datetime.now(timezone.utc).date()
         self.storage       = PositionStorage()
+        self._scan_count   = 0  # used to schedule resolution checks
 
         # Persistent cooldown — survives restarts
         self._cooldown_file = Path.home() / ".openclaw" / "bot_cooldowns.json"
         self.last_alerted: dict[str, datetime] = self._load_cooldowns()
 
         mode = "LIVE 🔴" if live else "PAPER 📋"
-        log.info(f"TediumBot starting — {mode}")
+        log.info(
+            f"TediumBot starting — {mode} "
+            f"(calibrated on {self.calib.total_resolved} resolved trades)"
+        )
+
+    # ── Model initialisation ──────────────────────────────────────────────────
+
+    def _init_models(self) -> None:
+        """Build/rebuild models using current calibration params."""
+        c = self.calib
+        self.edge_model   = EdgeModel(min_edge=c.edge_min_edge)
+        self.kelly        = KellyModel(kelly_fraction=0.25)  # base; per-strategy pct applied at call site
+        self.bond_scanner = BondScanner(
+            min_price=0.90, max_price=0.97, max_days=14,
+            min_annualised=c.bond_min_annualised,
+        )
+        self.ls_fader = LongshotFader(
+            max_yes_price=0.10, min_edge=c.longshot_min_edge,
+        )
+        self.ls_fader.LONGSHOT_FACTOR = c.longshot_factor
+        self.multi_scanner = MultiOutcomeScanner(min_edge=c.multi_min_edge)
+
+    def _apply_calibration(self, new_params: CalibrationParams) -> None:
+        """Apply updated calibration params and rebuild models."""
+        old = self.calib
+        self.calib = new_params
+        self._init_models()
+        log.info(
+            f"[CALIB] Updated — bond_kelly={new_params.bond_kelly_pct:.1%} "
+            f"ls_factor={new_params.longshot_factor:.2f} "
+            f"edge_min={new_params.edge_min_edge:.2%} "
+            f"(was {old.edge_min_edge:.2%}) "
+            f"total_resolved={new_params.total_resolved}"
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -418,6 +457,9 @@ class TediumBot:
                     split_tx=result.split_tx,
                     clob_order_id=result.clob_order_id,
                     clob_filled=result.clob_filled,
+                    strategy=opp.get("strategy", "edge"),
+                    predicted_edge=e.edge,
+                    predicted_win_prob=e.model_prob,
                 ))
                 return True
             else:
@@ -455,6 +497,9 @@ class TediumBot:
                         split_tx=trade.split_tx,
                         clob_order_id=trade.clob_order_id,
                         clob_filled=trade.clob_filled,
+                        strategy="multi",
+                        predicted_edge=result.edge_pct,
+                        predicted_win_prob=0.99,
                     ))
                 else:
                     log.error(f"  Leg failed: {trade.error}")
@@ -488,6 +533,16 @@ class TediumBot:
 
     async def run_once(self) -> None:
         self._reset_daily()
+        self._scan_count += 1
+
+        # Every 10 scans (~10 min): check for resolved positions + recalibrate
+        if self._scan_count % 10 == 0:
+            newly_resolved = await self._check_resolved_positions()
+            if newly_resolved > 0:
+                log.info(f"[CALIB] {newly_resolved} new resolved trades — recalibrating...")
+                new_params = self._calib_engine.calibrate()
+                self._apply_calibration(new_params)
+
         balance = self._balance()
         opportunities, multi_opps = await self._scan(balance)
 
@@ -559,6 +614,38 @@ class TediumBot:
             if self.running:
                 log.info(f"Next scan in {SCAN_INTERVAL}s")
                 await asyncio.sleep(SCAN_INTERVAL)
+
+    async def _check_resolved_positions(self) -> int:
+        """
+        Check open positions against Gamma API. For any that have resolved,
+        record the outcome and update position status. Returns count resolved.
+        """
+        open_positions = self.storage.get_open()
+        if not open_positions:
+            return 0
+
+        newly_resolved = 0
+        for pos in open_positions:
+            try:
+                market = await self.gamma.get_market(pos["market_id"])
+                if not market.resolved or not market.outcome:
+                    continue
+
+                outcome = record_resolved_position(pos, market)
+                if outcome:
+                    self._perf_store.append(outcome)
+                    self.storage.update_status(pos["position_id"], "resolved")
+                    result = "WON" if outcome.actual_win else "LOST"
+                    log.info(
+                        f"[RESOLVED] {result} '{pos['question'][:50]}' "
+                        f"pnl=${outcome.actual_pnl:+.2f} "
+                        f"strategy={outcome.strategy}"
+                    )
+                    newly_resolved += 1
+            except Exception as e:
+                log.debug(f"Resolution check failed for {pos['market_id']}: {e}")
+
+        return newly_resolved
 
     def stop(self) -> None:
         log.info("Stopping...")

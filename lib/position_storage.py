@@ -46,6 +46,11 @@ class PositionEntry:
     status: str = "open"  # open, closed, resolved
     notes: Optional[str] = None
 
+    # Calibration fields (optional — populated by bot, not CLI)
+    strategy: Optional[str] = None           # bond, longshot, edge, multi
+    predicted_edge: Optional[float] = None   # model's edge estimate at entry
+    predicted_win_prob: Optional[float] = None  # model's win probability at entry
+
 
 class PositionStorage:
     """Manage positions.json file with atomic writes."""
