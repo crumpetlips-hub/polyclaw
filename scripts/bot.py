@@ -17,6 +17,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -99,8 +100,11 @@ class TediumBot:
 
         self.daily_trades  = 0
         self.day_start     = datetime.now(timezone.utc).date()
-        # market_key -> last alert time (UTC)
-        self.last_alerted: dict[str, datetime] = {}
+        self.storage       = PositionStorage()
+
+        # Persistent cooldown — survives restarts
+        self._cooldown_file = Path.home() / ".openclaw" / "bot_cooldowns.json"
+        self.last_alerted: dict[str, datetime] = self._load_cooldowns()
 
         mode = "LIVE 🔴" if live else "PAPER 📋"
         log.info(f"TediumBot starting — {mode}")
@@ -142,6 +146,22 @@ class TediumBot:
         except Exception:
             return None
 
+    def _load_cooldowns(self) -> dict[str, datetime]:
+        try:
+            if self._cooldown_file.exists():
+                raw = json.loads(self._cooldown_file.read_text())
+                return {k: datetime.fromisoformat(v) for k, v in raw.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _save_cooldowns(self) -> None:
+        try:
+            raw = {k: v.isoformat() for k, v in self.last_alerted.items()}
+            self._cooldown_file.write_text(json.dumps(raw))
+        except Exception as e:
+            log.warning(f"Failed to save cooldowns: {e}")
+
     def _already_alerted(self, key: str) -> bool:
         last = self.last_alerted.get(key)
         if last is None:
@@ -151,6 +171,7 @@ class TediumBot:
 
     def _mark_alerted(self, key: str) -> None:
         self.last_alerted[key] = datetime.now(timezone.utc)
+        self._save_cooldowns()
 
     # ── Analysis pipeline ─────────────────────────────────────────────────────
 
@@ -385,6 +406,19 @@ class TediumBot:
             )
             if result.success:
                 log.info(f"Trade executed: {e.position} ${k.size_usd:.2f} TX:{result.split_tx[:20]}")
+                self.storage.add(PositionEntry(
+                    position_id=str(uuid.uuid4()),
+                    market_id=m.id,
+                    question=m.question,
+                    position=e.position,
+                    token_id=result.wanted_token_id,
+                    entry_time=datetime.now(timezone.utc).isoformat(),
+                    entry_amount=k.size_usd,
+                    entry_price=e.market_price,
+                    split_tx=result.split_tx,
+                    clob_order_id=result.clob_order_id,
+                    clob_filled=result.clob_filled,
+                ))
                 return True
             else:
                 log.error(f"Trade failed: {result.error}")
@@ -409,6 +443,19 @@ class TediumBot:
                     log.info(f"  Leg filled TX:{trade.split_tx[:20]}")
                     filled += 1
                     self.daily_trades += 1
+                    self.storage.add(PositionEntry(
+                        position_id=str(uuid.uuid4()),
+                        market_id=leg.market_id,
+                        question=leg.question,
+                        position="YES",
+                        token_id=trade.wanted_token_id,
+                        entry_time=datetime.now(timezone.utc).isoformat(),
+                        entry_amount=leg.size_usd,
+                        entry_price=leg.yes_price,
+                        split_tx=trade.split_tx,
+                        clob_order_id=trade.clob_order_id,
+                        clob_filled=trade.clob_filled,
+                    ))
                 else:
                     log.error(f"  Leg failed: {trade.error}")
             except Exception as ex:
